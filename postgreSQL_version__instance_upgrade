@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ===== CONFIG (edit these) =====
+PROJECT_ID="*************************"
+TARGET_VERSION="POSTGRES_14"   # e.g. POSTGRES_15
+
+INSTANCE_NAME="${1:-}"
+[[ -n "$INSTANCE_NAME" ]] || { echo "Usage: $0 <INSTANCE_NAME>"; exit 1; }
+
+log() { echo "$(date '+%F %T') : $*"; }
+
+ensure_auth() {
+  # Just ensure there is an active account; do not auto-login.
+  gcloud auth list --filter="status:ACTIVE" --format="value(account)" 2>/dev/null | head -n1 >/dev/null \
+    || { echo "ERROR: No active gcloud account. Run: gcloud auth login"; exit 1; }
+}
+
+wait_op() {
+  local inst="$1" op="$2" status
+  ensure_auth
+  while true; do
+    status="$(gcloud sql operations describe "$op" --project="$PROJECT_ID" --format="value(status)")"
+    log "$inst: operation $op status: $status"
+    case "$status" in
+      DONE) return 0 ;;
+      PENDING|RUNNING) sleep 30 ;;
+      *) echo "ERROR: $inst op $op failed: $status"; exit 1 ;;
+    esac
+  done
+}
+
+# ===== MAIN =====
+ensure_auth
+gcloud config set project "$PROJECT_ID" --quiet
+
+log "Checking instance $INSTANCE_NAME in $PROJECT_ID"
+gcloud sql instances describe "$INSTANCE_NAME" --project="$PROJECT_ID" >/dev/null
+
+PRIMARY_VERSION="$(gcloud sql instances describe "$INSTANCE_NAME" --project="$PROJECT_ID" --format="value(databaseVersion)")"
+REPLICA_NAME="$(gcloud sql instances describe "$INSTANCE_NAME" --project="$PROJECT_ID" --format="value(replicaNames[0])" || true)"
+
+log "Current primary version: $PRIMARY_VERSION"
+log "Target version         : $TARGET_VERSION"
+
+if [[ "$PRIMARY_VERSION" == "$TARGET_VERSION" ]]; then
+  if [[ -z "${REPLICA_NAME:-}" ]]; then
+    log "Primary is on target and no replica found. Nothing to do."
+    exit 0
+  fi
+
+  REPLICA_VERSION="$(gcloud sql instances describe "$REPLICA_NAME" --project="$PROJECT_ID" --format="value(databaseVersion)")"
+  log "Current replica version: $REPLICA_VERSION"
+
+  if [[ "$REPLICA_VERSION" == "$TARGET_VERSION" ]]; then
+    log "Primary and replica are already on target. Nothing to do."
+    exit 0
+  fi
+
+  read -r -p "Replica is $REPLICA_VERSION, target is $TARGET_VERSION. Type 'yes' to upgrade replica only: " CONFIRM
+  [[ "$CONFIRM" == "yes" ]] || { log "Replica-only upgrade cancelled."; exit 0; }
+
+  log "Disabling replication on replica $REPLICA_NAME"
+  op="$(gcloud sql instances patch "$REPLICA_NAME" \
+          --project="$PROJECT_ID" \
+          --no-enable-database-replication \
+          --quiet --async --format='value(name)')"
+  wait_op "$REPLICA_NAME" "$op"
+
+  log "Upgrading replica $REPLICA_NAME"
+  op="$(gcloud sql instances patch "$REPLICA_NAME" \
+          --project="$PROJECT_ID" \
+          --database-version="$TARGET_VERSION" \
+          --quiet --async --format='value(name)')"
+  wait_op "$REPLICA_NAME" "$op"
+
+  log "Re-enabling replication on $REPLICA_NAME"
+  op="$(gcloud sql instances patch "$REPLICA_NAME" \
+          --project="$PROJECT_ID" \
+          --enable-database-replication \
+          --quiet --async --format='value(name)')"
+  wait_op "$REPLICA_NAME" "$op"
+
+  NEW_REPLICA_VERSION="$(gcloud sql instances describe "$REPLICA_NAME" --project="$PROJECT_ID" --format="value(databaseVersion)")"
+  log "Final replica version: $NEW_REPLICA_VERSION"
+  [[ "$NEW_REPLICA_VERSION" == "$TARGET_VERSION" ]] || { echo "ERROR: replica upgrade failed"; exit 1; }
+
+  log "Replica-only upgrade completed."
+  exit 0
+fi
+
+log "Running precheck..."
+gcloud sql instances pre-check-major-version-upgrade "$INSTANCE_NAME" \
+  --project="$PROJECT_ID" \
+  --target-database-version="$TARGET_VERSION"
+
+log "Creating backup..."
+BACKUP_ID="$(gcloud sql backups create --instance="$INSTANCE_NAME" --project="$PROJECT_ID" --format="value(id)")" || BACKUP_ID=""
+log "Backup ID: $BACKUP_ID"
+log "Restore cmd: gcloud sql backups restore $BACKUP_ID --restore-instance=$INSTANCE_NAME --project=$PROJECT_ID"
+
+read -r -p "Type 'yes' to upgrade $INSTANCE_NAME -> $TARGET_VERSION: " CONFIRM
+[[ "$CONFIRM" == "yes" ]] || { log "Cancelled."; exit 0; }
+
+# Disable replica replication (if any)
+if [[ -n "${REPLICA_NAME:-}" ]]; then
+  log "Disabling replication on replica $REPLICA_NAME"
+  op="$(gcloud sql instances patch "$REPLICA_NAME" \
+          --project="$PROJECT_ID" \
+          --no-enable-database-replication \
+          --quiet --async --format='value(name)')"
+  wait_op "$REPLICA_NAME" "$op"
+fi
+
+# Upgrade primary
+log "Upgrading primary $INSTANCE_NAME"
+op="$(gcloud sql instances patch "$INSTANCE_NAME" \
+        --project="$PROJECT_ID" \
+        --database-version="$TARGET_VERSION" \
+        --quiet --async --format='value(name)')"
+wait_op "$INSTANCE_NAME" "$op"
+
+# Upgrade replica and re-enable replication (if any)
+if [[ -n "${REPLICA_NAME:-}" ]]; then
+  log "Upgrading replica $REPLICA_NAME"
+  op="$(gcloud sql instances patch "$REPLICA_NAME" \
+          --project="$PROJECT_ID" \
+          --database-version="$TARGET_VERSION" \
+          --quiet --async --format='value(name)')"
+  wait_op "$REPLICA_NAME" "$op"
+
+  log "Re-enabling replication on $REPLICA_NAME"
+  op="$(gcloud sql instances patch "$REPLICA_NAME" \
+          --project="$PROJECT_ID" \
+          --enable-database-replication \
+          --quiet --async --format='value(name)')"
+  wait_op "$REPLICA_NAME" "$op"
+fi
+
+# Verify
+NEW_PRIMARY_VERSION="$(gcloud sql instances describe "$INSTANCE_NAME" --project="$PROJECT_ID" --format="value(databaseVersion)")"
+log "Final primary version: $NEW_PRIMARY_VERSION"
+[[ "$NEW_PRIMARY_VERSION" == "$TARGET_VERSION" ]] || { echo "ERROR: primary upgrade failed"; exit 1; }
+
+if [[ -n "${REPLICA_NAME:-}" ]]; then
+  NEW_REPLICA_VERSION="$(gcloud sql instances describe "$REPLICA_NAME" --project="$PROJECT_ID" --format="value(databaseVersion)")"
+  log "Final replica version: $NEW_REPLICA_VERSION"
+fi
+
+log "Upgrade completed."
